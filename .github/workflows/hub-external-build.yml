@@ -1,0 +1,76 @@
+name: Hub External Build
+on:
+  workflow_dispatch:
+    inputs:
+      source_url:        { description: "Signed URL to source ZIP", required: true, type: string }
+      source_hash:       { description: "SHA-256 of source", required: true, type: string }
+      callback_url:      { description: "Hub callback endpoint", required: true, type: string }
+      build_token:       { description: "Per-build auth token", required: true, type: string }
+      build_id:          { description: "Hub ExternalBuild id", required: true, type: string }
+      package_manager:   { description: "npm|pnpm|yarn", required: true, type: string, default: "npm" }
+      build_command:     { description: "Build command", required: false, type: string, default: "" }
+      test_command:      { description: "Test command", required: false, type: string, default: "" }
+      working_directory: { description: "Working directory inside source", required: false, type: string, default: "" }
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      WORKDIR: ${{ inputs.working_directory }}
+    steps:
+      - name: Download and verify source
+        run: |
+          set -euo pipefail
+          curl -fsSL "${{ inputs.source_url }}" -o source.zip
+          echo "${{ inputs.source_hash }}  source.zip" | sha256sum -c -
+          rm -rf workspace && mkdir -p workspace
+          unzip -q source.zip -d workspace
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Install dependencies
+        run: |
+          set -euo pipefail
+          cd "workspace${WORKDIR:+/$WORKDIR}"
+          case "${{ inputs.package_manager }}" in
+            npm)  npm install ;;
+            pnpm) npm i -g pnpm && pnpm install ;;
+            yarn) corepack enable && yarn install ;;
+            *) echo "Unknown package manager" >&2; exit 1 ;;
+          esac
+      - name: Build
+        id: build
+        if: always()
+        continue-on-error: true
+        run: |
+          cd "workspace${WORKDIR:+/$WORKDIR}"
+          if [ -n "${{ inputs.build_command }}" ]; then
+            ${{ inputs.build_command }}
+          else
+            echo "No build command configured — skipping build step."
+          fi
+      - name: Test
+        id: test
+        if: always() && ${{ inputs.test_command != "" }}
+        continue-on-error: true
+        run: |
+          cd "workspace${WORKDIR:+/$WORKDIR}"
+          ${{ inputs.test_command }}
+      - name: Report result
+        if: always()
+        run: |
+          set -euo pipefail
+          BUILD_OUTCOME="${{ steps.build.outcome }}"
+          TEST_OUTCOME="${{ steps.test.outcome }}"
+          build_status="skipped"
+          if [ "$BUILD_OUTCOME" = "success" ]; then build_status="passed";
+          elif [ "$BUILD_OUTCOME" = "failure" ]; then build_status="failed"; fi
+          test_status="skipped"
+          if [ -z "$TEST_OUTCOME" ] || [ "$TEST_OUTCOME" = "skipped" ]; then test_status="skipped";
+          elif [ "$TEST_OUTCOME" = "success" ]; then test_status="passed";
+          elif [ "$TEST_OUTCOME" = "failure" ]; then test_status="failed"; fi
+          logs_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          jq -n --arg build_id "${{ inputs.build_id }}" --arg source_hash "${{ inputs.source_hash }}" --arg commit_sha "${{ github.sha }}" --arg run_id "${{ github.run_id }}" --arg build_status "$build_status" --arg test_status "$test_status" --arg logs_reference "$logs_url" '{build_id:$build_id,source_hash:$source_hash,commit_sha:$commit_sha,run_id:$run_id,build_status:$build_status,test_status:$test_status,logs_reference:$logs_reference}' > payload.json
+          curl -fsSL -X POST "${{ inputs.callback_url }}" -H "Authorization: Bearer ${{ inputs.build_token }}" -H "Content-Type: application/json" --data-binary @payload.json
