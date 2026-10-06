@@ -53,7 +53,7 @@ jobs:
           fi
       - name: Test
         id: test
-        if: always() && ${{ inputs.test_command != '' }}
+        if: ${{ always() && inputs.test_command != '' }}
         continue-on-error: true
         run: |
           cd "workspace${WORKDIR:+/$WORKDIR}"
